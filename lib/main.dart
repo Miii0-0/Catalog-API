@@ -8,6 +8,8 @@ void main() {
   runApp(const MainApp());
 }
 
+const _apiHost = 'localhost:8080';
+
 class MainApp extends StatelessWidget {
   const MainApp({super.key});
 
@@ -53,6 +55,7 @@ class _CatalogState extends State<Catalog> {
   int _requestId = 0;
   bool _isLoading = true;
   bool _isLoadingMore = false;
+  bool _isMutating = false;
 
   @override
   void initState() {
@@ -72,7 +75,7 @@ class _CatalogState extends State<Catalog> {
   Future<void> _loadCategories() async {
     try {
       final response = await _client.get(
-        Uri.https('dummyjson.com', '/products/category-list'),
+        Uri.http(_apiHost, '/products/category-list'),
       );
       if (response.statusCode != 200) {
         throw Exception('Server mengembalikan status ${response.statusCode}.');
@@ -119,7 +122,7 @@ class _CatalogState extends State<Catalog> {
           'q': _searchQuery,
       };
       final response = await _client.get(
-        Uri.https('dummyjson.com', path, queryParameters),
+        Uri.http(_apiHost, path, queryParameters),
       );
       if (response.statusCode != 200) {
         throw Exception('Server mengembalikan status ${response.statusCode}.');
@@ -178,6 +181,105 @@ class _CatalogState extends State<Catalog> {
           duration: const Duration(seconds: 2),
           behavior: SnackBarBehavior.floating,
         ),
+      );
+  }
+
+  Future<void> _createProduct() async {
+    final values = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (_) => const _ProductFormDialog(),
+    );
+    if (values == null || !mounted) return;
+
+    await _mutateProduct(
+      request: () => _client.post(
+        Uri.http(_apiHost, '/products/add'),
+        headers: const {'content-type': 'application/json'},
+        body: jsonEncode(values),
+      ),
+      successMessage: 'Produk berhasil ditambahkan',
+    );
+  }
+
+  Future<void> _editProduct(Product product) async {
+    final id = product.id;
+    if (id == null) {
+      _showMessage('Produk tidak memiliki ID sehingga tidak dapat diedit.');
+      return;
+    }
+    final values = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (_) => _ProductFormDialog(product: product),
+    );
+    if (values == null || !mounted) return;
+
+    await _mutateProduct(
+      request: () => _client.put(
+        Uri.http(_apiHost, '/products/$id'),
+        headers: const {'content-type': 'application/json'},
+        body: jsonEncode(values),
+      ),
+      successMessage: 'Produk berhasil diperbarui',
+    );
+  }
+
+  Future<void> _deleteProduct(Product product) async {
+    final id = product.id;
+    if (id == null) {
+      _showMessage('Produk tidak memiliki ID sehingga tidak dapat dihapus.');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Hapus produk?'),
+        content: Text('Produk "${product.title}" akan dihapus.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Batal'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Hapus'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    await _mutateProduct(
+      request: () => _client.delete(Uri.http(_apiHost, '/products/$id')),
+      successMessage: 'Produk berhasil dihapus',
+    );
+  }
+
+  Future<void> _mutateProduct({
+    required Future<http.Response> Function() request,
+    required String successMessage,
+  }) async {
+    setState(() => _isMutating = true);
+    try {
+      final response = await request();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('Server mengembalikan status ${response.statusCode}.');
+      }
+      if (!mounted) return;
+      _showMessage(successMessage);
+      await _loadProducts();
+      await _loadCategories();
+    } catch (error) {
+      if (mounted) _showMessage('Gagal menyimpan perubahan: $error');
+    } finally {
+      if (mounted) setState(() => _isMutating = false);
+    }
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
       );
   }
 
@@ -349,6 +451,9 @@ class _CatalogState extends State<Catalog> {
                     itemBuilder: (context, index) => _ProductCard(
                       product: _products[index],
                       onAdd: () => _addToCart(_products[index]),
+                      onEdit: () => _editProduct(_products[index]),
+                      onDelete: () => _deleteProduct(_products[index]),
+                      actionsEnabled: !_isMutating,
                     ),
                   );
                 },
@@ -380,6 +485,11 @@ class _CatalogState extends State<Catalog> {
             ],
           ],
         ),
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _isMutating ? null : _createProduct,
+        icon: const Icon(Icons.add),
+        label: const Text('Tambah produk'),
       ),
     );
   }
@@ -416,10 +526,19 @@ class _ErrorMessage extends StatelessWidget {
 }
 
 class _ProductCard extends StatelessWidget {
-  const _ProductCard({required this.product, required this.onAdd});
+  const _ProductCard({
+    required this.product,
+    required this.onAdd,
+    required this.onEdit,
+    required this.onDelete,
+    required this.actionsEnabled,
+  });
 
   final Product product;
   final VoidCallback onAdd;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+  final bool actionsEnabled;
 
   @override
   Widget build(BuildContext context) {
@@ -487,6 +606,46 @@ class _ProductCard extends StatelessWidget {
                       ),
                     ),
                   ),
+                Positioned(
+                  top: 2,
+                  right: 2,
+                  child: Material(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    shape: const CircleBorder(),
+                    child: PopupMenuButton<_ProductAction>(
+                      tooltip: 'Kelola produk',
+                      enabled: actionsEnabled,
+                      onSelected: (action) {
+                        if (action == _ProductAction.edit) {
+                          onEdit();
+                        } else {
+                          onDelete();
+                        }
+                      },
+                      itemBuilder: (context) => [
+                        PopupMenuItem(
+                          value: _ProductAction.edit,
+                          enabled: product.id != null,
+                          child: const ListTile(
+                            leading: Icon(Icons.edit_outlined),
+                            title: Text('Edit'),
+                            contentPadding: EdgeInsets.zero,
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: _ProductAction.delete,
+                          enabled: product.id != null,
+                          child: const ListTile(
+                            leading: Icon(Icons.delete_outline),
+                            title: Text('Hapus'),
+                            contentPadding: EdgeInsets.zero,
+                          ),
+                        ),
+                      ],
+                      icon: const Icon(Icons.more_vert),
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -574,6 +733,155 @@ class _ProductCard extends StatelessWidget {
   }
 }
 
+enum _ProductAction { edit, delete }
+
+class _ProductFormDialog extends StatefulWidget {
+  const _ProductFormDialog({this.product});
+
+  final Product? product;
+
+  @override
+  State<_ProductFormDialog> createState() => _ProductFormDialogState();
+}
+
+class _ProductFormDialogState extends State<_ProductFormDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _titleController;
+  late final TextEditingController _categoryController;
+  late final TextEditingController _priceController;
+  late final TextEditingController _discountController;
+  late final TextEditingController _stockController;
+  late final TextEditingController _thumbnailController;
+
+  @override
+  void initState() {
+    super.initState();
+    final product = widget.product;
+    _titleController = TextEditingController(text: product?.title ?? '');
+    _categoryController = TextEditingController(text: product?.category ?? '');
+    _priceController = TextEditingController(
+      text: product == null ? '' : '${product.price}',
+    );
+    _discountController = TextEditingController(
+      text: product == null ? '0' : '${product.discountPercentage}',
+    );
+    _stockController = TextEditingController(
+      text: product == null ? '' : '${product.stock}',
+    );
+    _thumbnailController = TextEditingController(
+      text: product?.thumbnail ?? '',
+    );
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _categoryController.dispose();
+    _priceController.dispose();
+    _discountController.dispose();
+    _stockController.dispose();
+    _thumbnailController.dispose();
+    super.dispose();
+  }
+
+  String? _requiredText(String? value) {
+    return value == null || value.trim().isEmpty ? 'Wajib diisi' : null;
+  }
+
+  String? _nonNegativeNumber(String? value) {
+    final number = double.tryParse(value?.trim() ?? '');
+    return number == null || number < 0 ? 'Masukkan angka valid' : null;
+  }
+
+  String? _nonNegativeInteger(String? value) {
+    final number = int.tryParse(value?.trim() ?? '');
+    return number == null || number < 0 ? 'Masukkan bilangan bulat' : null;
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(context, <String, dynamic>{
+      'title': _titleController.text.trim(),
+      'category': _categoryController.text.trim(),
+      'price': double.parse(_priceController.text.trim()),
+      'discountPercentage': double.parse(_discountController.text.trim()),
+      'rating': widget.product?.rating ?? 0,
+      'stock': int.parse(_stockController.text.trim()),
+      'thumbnail': _thumbnailController.text.trim(),
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.product == null ? 'Tambah produk' : 'Edit produk'),
+      content: SizedBox(
+        width: 420,
+        child: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: _titleController,
+                  decoration: const InputDecoration(labelText: 'Nama produk'),
+                  validator: _requiredText,
+                  textCapitalization: TextCapitalization.sentences,
+                ),
+                TextFormField(
+                  controller: _categoryController,
+                  decoration: const InputDecoration(labelText: 'Kategori'),
+                  validator: _requiredText,
+                ),
+                TextFormField(
+                  controller: _priceController,
+                  decoration: const InputDecoration(labelText: 'Harga'),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  validator: _nonNegativeNumber,
+                ),
+                TextFormField(
+                  controller: _discountController,
+                  decoration: const InputDecoration(labelText: 'Diskon (%)'),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  validator: _nonNegativeNumber,
+                ),
+                TextFormField(
+                  controller: _stockController,
+                  decoration: const InputDecoration(labelText: 'Stok'),
+                  keyboardType: TextInputType.number,
+                  validator: _nonNegativeInteger,
+                ),
+                TextFormField(
+                  controller: _thumbnailController,
+                  decoration: const InputDecoration(
+                    labelText: 'URL gambar (opsional)',
+                  ),
+                  keyboardType: TextInputType.url,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal'),
+        ),
+        FilledButton(
+          onPressed: _submit,
+          child: Text(widget.product == null ? 'Tambah' : 'Simpan'),
+        ),
+      ],
+    );
+  }
+}
+
 class ProductPage {
   const ProductPage({required this.products, required this.total});
 
@@ -592,6 +900,7 @@ class ProductPage {
 
 class Product {
   const Product({
+    required this.id,
     required this.title,
     required this.category,
     required this.price,
@@ -601,6 +910,7 @@ class Product {
     required this.thumbnail,
   });
 
+  final int? id;
   final String title;
   final String category;
   final double price;
@@ -611,6 +921,7 @@ class Product {
 
   factory Product.fromJson(Map<String, dynamic> json) {
     return Product(
+      id: (json['id'] as num?)?.toInt(),
       title: json['title'] as String? ?? 'Produk tanpa nama',
       category: json['category'] as String? ?? 'lainnya',
       price: (json['price'] as num?)?.toDouble() ?? 0,
